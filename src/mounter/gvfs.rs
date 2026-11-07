@@ -259,6 +259,7 @@ fn dir_info(uri: &str) -> Result<(String, String, Option<PathBuf>), glib::Error>
 
 fn mount_op(
     uri: String,
+    silent: bool,
     event_tx: std::sync::Weak<crate::channel::Sender<Event>>,
 ) -> gio::MountOperation {
     let mount_op = gio::MountOperation::new();
@@ -282,6 +283,10 @@ fn mount_op(
                     .contains(gio::AskPasswordFlags::ANONYMOUS_SUPPORTED)
                     .then_some(false),
             };
+            if silent {
+                mount_op.reply(gio::MountOperationResult::Aborted);
+                return;
+            }
             let (auth_tx, mut auth_rx) = mpsc::channel(1);
             if let Some(event_tx) = event_tx.upgrade() {
                 event_tx.send(Event::NetworkAuth(uri.clone(), auth, auth_tx));
@@ -314,7 +319,11 @@ enum Cmd {
         MounterItem,
         tokio::sync::oneshot::Sender<anyhow::Result<()>>,
     ),
-    NetworkDrive(String, tokio::sync::oneshot::Sender<anyhow::Result<()>>),
+    NetworkDrive(
+        String,
+        bool,
+        tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    ),
     NetworkScan(String, IconSizes, mpsc::Sender<Result<Vec<Item>, String>>),
     DirInfo(
         String,
@@ -507,7 +516,7 @@ impl Gvfs {
 
                                 log::info!("mount {name}");
                                 //TODO: do not use name as a URI for mount_op
-                                let mount_op = mount_op(name.to_string(), event_tx.clone());
+                                let mount_op = mount_op(name.to_string(), false, event_tx.clone());
                                 let event_tx = event_tx.clone();
                                 let mounter_item = mounter_item.clone();
                                 let volume_for_callback = volume.clone();
@@ -555,9 +564,9 @@ impl Gvfs {
                                 break;
                             }
                         }
-                        Cmd::NetworkDrive(uri, result_tx) => {
+                        Cmd::NetworkDrive(uri, silent, result_tx) => {
                             let file = gio::File::for_uri(&uri);
-                            let mount_op = mount_op(uri.clone(), event_tx.clone());
+                            let mount_op = mount_op(uri.clone(), silent, event_tx.clone());
                             let event_tx = event_tx.clone();
                             file.mount_enclosing_volume(
                                 gio::MountMountFlags::NONE,
@@ -591,7 +600,7 @@ impl Gvfs {
                             };
 
                             if needs_mount {
-                                let mount_op = mount_op(resolved_uri.clone(), event_tx.clone());
+                                let mount_op = mount_op(resolved_uri.clone(), false, event_tx.clone());
                                 let event_tx = event_tx.clone();
                                 file.mount_enclosing_volume(
                                     gio::MountMountFlags::empty(),
@@ -698,13 +707,13 @@ impl Mounter for Gvfs {
         )
     }
 
-    fn network_drive(&self, uri: String) -> Task<bool> {
+    fn network_drive(&self, uri: String, silent: bool) -> Task<bool> {
         let command_tx = self.command_tx.clone();
         Task::perform(
             async move {
                 let (res_tx, res_rx) = tokio::sync::oneshot::channel();
 
-                command_tx.send(Cmd::NetworkDrive(uri, res_tx)).unwrap();
+                command_tx.send(Cmd::NetworkDrive(uri, silent, res_tx)).unwrap();
                 res_rx.await
             },
             |result| match result {

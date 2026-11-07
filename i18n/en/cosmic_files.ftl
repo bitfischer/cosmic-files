@@ -179,6 +179,11 @@ support = Support
 ## Add Network Drive
 add-network-drive = Add network drive
 connect = Connect
+saved-network-drives = Saved network drives
+auto-mount = Auto-mount
+forget-all = Forget all
+forget-network-drive = Forget network drive
+forget-network-drive-note = Forgetting a drive does not unmount it. Saved passwords are managed by your keyring.
 connect-anonymously = Connect anonymously
 connecting = Connecting...
 domain = Domain

@@ -198,6 +198,68 @@ impl State {
     }
 }
 
+/// A network drive the user connected to via "Add network drive".
+/// Passwords are never stored here, only in the keyring managed by gvfs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SavedNetworkDrive {
+    pub uri: String,
+    #[serde(default)]
+    pub auto_mount: bool,
+}
+
+impl SavedNetworkDrive {
+    pub fn new(uri: &str) -> Self {
+        Self {
+            uri: normalize_network_uri(uri),
+            auto_mount: false,
+        }
+    }
+
+    /// Short label for display, e.g. `user@host (sftp)`.
+    pub fn display_name(&self) -> String {
+        let (scheme, rest) = self.uri.split_once("://").unwrap_or(("", &self.uri));
+        let authority = rest.split('/').next().unwrap_or(rest);
+        if scheme.is_empty() {
+            authority.to_string()
+        } else {
+            format!("{authority} ({scheme})")
+        }
+    }
+}
+
+/// Normalize a network URI for storage: trim, lowercase scheme and host,
+/// strip any password and the trailing slash.
+pub fn normalize_network_uri(uri: &str) -> String {
+    let uri = uri.trim();
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return uri.to_string();
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let authority = match authority.rsplit_once('@') {
+        Some((userinfo, host)) => {
+            let user = userinfo.split(':').next().unwrap_or(userinfo);
+            format!("{user}@{}", host.to_lowercase())
+        }
+        None => authority.to_lowercase(),
+    };
+    let path = path.trim_end_matches('/');
+    format!("{}://{authority}{path}", scheme.to_lowercase())
+}
+
+/// Key identifying the server of a URI: scheme, user, host and port, ignoring path.
+/// Used to match saved drives against mounts reported by gvfs.
+pub fn network_uri_server_key(uri: &str) -> String {
+    let normalized = normalize_network_uri(uri);
+    let Some((scheme, rest)) = normalized.split_once("://") else {
+        return normalized;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    format!("{scheme}://{authority}")
+}
+
 #[derive(Clone, CosmicConfigEntry, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -207,6 +269,7 @@ pub struct Config {
     pub context_actions: Vec<ContextActionPreset>,
     pub thumb_cfg: ThumbCfg,
     pub favorites: Vec<Favorite>,
+    pub saved_network_drives: Vec<SavedNetworkDrive>,
     pub show_details: bool,
     pub show_recents: bool,
     pub tab: TabConfig,
@@ -271,6 +334,7 @@ impl Default for Config {
                 Favorite::Pictures,
                 Favorite::Videos,
             ],
+            saved_network_drives: Vec::new(),
             show_details: false,
             show_recents: true,
             tab: TabConfig::default(),
@@ -428,6 +492,23 @@ pub struct TimeConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn normalize_network_uri_strips_password_and_slash() {
+        assert_eq!(
+            super::normalize_network_uri(" SFTP://bob:secret@Example.COM/Share/ "),
+            "sftp://bob@example.com/Share"
+        );
+        assert_eq!(super::normalize_network_uri("smb://Host/"), "smb://host");
+    }
+
+    #[test]
+    fn server_key_ignores_path() {
+        assert_eq!(
+            super::network_uri_server_key("smb://host/a/b"),
+            super::network_uri_server_key("smb://HOST")
+        );
+    }
+
     use super::*;
 
     #[test]

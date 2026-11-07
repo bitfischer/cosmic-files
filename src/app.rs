@@ -61,8 +61,9 @@ use crate::clipboard::{
     ClipboardPasteText, ClipboardPasteVideo,
 };
 use crate::config::{
-    AppTheme, Config, DesktopConfig, Favorite, IconSizes, State, TIME_CONFIG_ID, TabConfig,
-    TimeConfig, TypeToSearch,
+    AppTheme, Config, DesktopConfig, Favorite, IconSizes, SavedNetworkDrive, State,
+    TIME_CONFIG_ID, TabConfig, TimeConfig, TypeToSearch, network_uri_server_key,
+    normalize_network_uri,
 };
 use crate::dialog::{Dialog, DialogKind, DialogMessage, DialogResult, DialogSettings};
 use crate::item::{FsKind, Item, ItemMetadata, folder_icon_symbolic, item_from_path};
@@ -320,6 +321,7 @@ pub enum NavMenuAction {
     RunContextAction(segmented_button::Entity, usize),
     RemoveFromSidebar(segmented_button::Entity),
     ChangeSidebarLabel(segmented_button::Entity),
+    ForgetNetworkDrive(segmented_button::Entity),
 }
 
 impl MenuAction for NavMenuAction {
@@ -373,6 +375,10 @@ pub enum Message {
     NavBarContext(Entity),
     NavMenuAction(NavMenuAction),
     NetworkAuth(MounterKey, String, MounterAuth, mpsc::Sender<MounterAuth>),
+    NetworkDriveAutoMount(String, bool),
+    NetworkDriveConnectSaved(String),
+    NetworkDriveForget(String),
+    NetworkDriveForgetAll,
     NetworkDriveInput(String),
     NetworkDriveOpenEntityAfterMount {
         entity: Entity,
@@ -668,6 +674,9 @@ pub struct FavoriteIndex(usize);
 
 pub struct MounterData(MounterKey, MounterItem);
 
+/// Nav bar data for a saved network drive that is not currently mounted
+pub struct SavedNetworkData(String);
+
 #[derive(Clone, Debug)]
 pub enum WindowKind {
     Desktop(Entity),
@@ -737,6 +746,9 @@ pub struct App {
     mounter_items: FxHashMap<MounterKey, MounterItems>,
     must_save_sort_names: bool,
     network_drive_connecting: Option<(MounterKey, String)>,
+    /// URIs submitted from the add network drive page, saved once mounted
+    network_drive_submitted: Vec<String>,
+    network_drives_auto_mounted: bool,
     network_drive_input: String,
     #[cfg(feature = "notify")]
     notification_opt: Option<Arc<std::sync::Mutex<notify_rust::NotificationHandle>>>,
@@ -1718,6 +1730,46 @@ impl App {
         }
     }
 
+    fn is_network_drive_mounted(&self, uri: &str) -> bool {
+        let key = network_uri_server_key(uri);
+        self.mounter_items.values().flatten().any(|item| {
+            item.is_mounted() && item.is_remote() && network_uri_server_key(&item.uri()) == key
+        })
+    }
+
+    fn save_network_drives(&mut self, drives: Vec<SavedNetworkDrive>) {
+        match &self.config_handler {
+            Some(config_handler) => {
+                if let Err(err) = self.config.set_saved_network_drives(config_handler, drives) {
+                    log::warn!("failed to save network drives: {err}");
+                }
+            }
+            None => {
+                self.config.saved_network_drives = drives;
+                log::warn!("failed to save network drives: no config handler");
+            }
+        }
+    }
+
+    /// Silently mount saved network drives with auto-mount enabled.
+    fn auto_mount_network_drives(&self) -> Vec<Task<Message>> {
+        let Some((_, mounter)) = MOUNTERS.iter().next() else {
+            return Vec::new();
+        };
+        self.config
+            .saved_network_drives
+            .iter()
+            .filter(|drive| drive.auto_mount && !self.is_network_drive_mounted(&drive.uri))
+            .map(|drive| {
+                let uri = drive.uri.clone();
+                mounter.network_drive(uri.clone(), true).map(move |mounted| {
+                    log::info!("auto-mount of {uri:?}: {mounted}");
+                    cosmic::action::none()
+                })
+            })
+            .collect()
+    }
+
     fn update_nav_model(&mut self) {
         let mut nav_model = segmented_button::ModelBuilder::default();
 
@@ -1782,6 +1834,7 @@ impl App {
         for (key, items) in &self.mounter_items {
             nav_items.extend(items.iter().map(|item| (*key, item)));
         }
+        let mut needs_divider = nav_items.is_empty();
         // Sort by name lexically
         nav_items.sort_by(|a, b| LANGUAGE_SORTER.compare(&a.1.name(), &b.1.name()));
         // Add items to nav model
@@ -1809,6 +1862,28 @@ impl App {
                 }
                 b
             });
+        }
+
+        // Saved network drives that are not mounted
+        if !MOUNTERS.is_empty() {
+            for drive in &self.config.saved_network_drives {
+                if self.is_network_drive_mounted(&drive.uri) {
+                    continue;
+                }
+                let divider = std::mem::take(&mut needs_divider);
+                nav_model = nav_model.insert(|mut b| {
+                    b = b
+                        .text(drive.display_name())
+                        .icon(icon::icon(
+                            icon::from_name("network-server-symbolic").size(16).handle(),
+                        ))
+                        .data(SavedNetworkData(drive.uri.clone()));
+                    if divider {
+                        b = b.divider_above();
+                    }
+                    b
+                });
+            }
         }
 
         self.nav_model = nav_model.build();
@@ -1922,12 +1997,48 @@ impl App {
                 table = table.push(widget::divider::horizontal::light());
             }
         }
-        widget::column::with_children([
-            widget::text::body(fl!("network-drive-description")).into(),
-            table.into(),
-        ])
-        .spacing(space_m)
-        .into()
+        let mut column = widget::column::with_capacity(3).spacing(space_m);
+        if !self.config.saved_network_drives.is_empty() {
+            let mut saved = widget::column::with_capacity(self.config.saved_network_drives.len())
+                .spacing(space_xxs);
+            for drive in &self.config.saved_network_drives {
+                let uri = drive.uri.clone();
+                saved = saved.push(
+                    widget::row::with_children([
+                        widget::text::body(drive.display_name())
+                            .width(Length::Fill)
+                            .into(),
+                        widget::checkbox(drive.auto_mount)
+                            .label(fl!("auto-mount"))
+                            .on_toggle({
+                                let uri = uri.clone();
+                                move |value| Message::NetworkDriveAutoMount(uri.clone(), value)
+                            })
+                            .into(),
+                        widget::button::standard(fl!("connect"))
+                            .on_press(Message::NetworkDriveConnectSaved(uri.clone()))
+                            .into(),
+                        widget::button::icon(widget::icon::from_name("edit-delete-symbolic"))
+                            .on_press(Message::NetworkDriveForget(uri))
+                            .into(),
+                    ])
+                    .spacing(space_xxs)
+                    .align_y(Alignment::Center),
+                );
+            }
+            column = column
+                .push(widget::text::heading(fl!("saved-network-drives")))
+                .push(saved)
+                .push(
+                    widget::button::standard(fl!("forget-all"))
+                        .on_press(Message::NetworkDriveForgetAll),
+                )
+                .push(widget::text::caption(fl!("forget-network-drive-note")));
+        }
+        column
+            .push(widget::text::body(fl!("network-drive-description")))
+            .push(table)
+            .into()
     }
 
     fn desktop_view_options(&self) -> Element<'_, Message> {
@@ -2406,6 +2517,8 @@ impl Application for App {
             mounter_items: FxHashMap::default(),
             must_save_sort_names: false,
             network_drive_connecting: None,
+            network_drive_submitted: Vec::new(),
+            network_drives_auto_mounted: false,
             network_drive_input: String::new(),
             #[cfg(feature = "notify")]
             notification_opt: None,
@@ -2527,6 +2640,15 @@ impl Application for App {
 
             let mut items: Vec<widget::menu::Item<NavMenuAction, String>> = Vec::with_capacity(7);
 
+            if self.nav_model.data::<SavedNetworkData>(entity).is_some() {
+                items.push(cosmic::widget::menu::Item::Button(
+                    fl!("forget-network-drive"),
+                    None,
+                    NavMenuAction::ForgetNetworkDrive(entity),
+                ));
+                return items;
+            }
+
             if location_opt
                 .and_then(Location::path_opt)
                 .is_some_and(|x| x.is_file())
@@ -2630,6 +2752,9 @@ impl Application for App {
 
     fn on_nav_select(&mut self, entity: Entity) -> Task<Self::Message> {
         self.nav_model.activate(entity);
+        if let Some(SavedNetworkData(uri)) = self.nav_model.data::<SavedNetworkData>(entity) {
+            return self.update(Message::NetworkDriveConnectSaved(uri.clone()));
+        }
         if let Some(location) = self.nav_model.data::<Location>(entity) {
             let should_open = match location {
                 #[cfg(feature = "gvfs")]
@@ -2657,7 +2782,7 @@ impl Application for App {
                         })
                         && let Some(mounter) = MOUNTERS.get(&key)
                     {
-                        return mounter.network_drive(uri.clone()).map(move |mounted| {
+                        return mounter.network_drive(uri.clone(), false).map(move |mounted| {
                             if mounted {
                                 cosmic::Action::App(Message::NetworkDriveOpenEntityAfterMount {
                                     entity,
@@ -3488,6 +3613,12 @@ impl Application for App {
                 //TODO: this could change favorites IDs while they are in use
                 self.update_nav_model();
 
+                // Silently remount saved network drives once at startup
+                if !self.network_drives_auto_mounted && matches!(self.mode, Mode::App) {
+                    self.network_drives_auto_mounted = true;
+                    commands.extend(self.auto_mount_network_drives());
+                }
+
                 // Update desktop tabs
                 commands.push(self.update_desktop());
 
@@ -3568,6 +3699,41 @@ impl Application for App {
                     Some(self.dialog_text_input.clone()),
                 );
             }
+            Message::NetworkDriveAutoMount(uri, auto_mount) => {
+                let mut drives = self.config.saved_network_drives.clone();
+                if let Some(drive) = drives.iter_mut().find(|d| d.uri == uri) {
+                    drive.auto_mount = auto_mount;
+                    self.save_network_drives(drives);
+                }
+            }
+            Message::NetworkDriveConnectSaved(uri) => {
+                if let Some((mounter_key, mounter)) = MOUNTERS.iter().next() {
+                    self.network_drive_connecting = Some((*mounter_key, uri.clone()));
+                    let name = SavedNetworkDrive::new(&uri).display_name();
+                    let location = Location::Network(uri.clone(), name, None);
+                    return mounter
+                        .network_drive(uri, false)
+                        .map(move |mounted| {
+                            if mounted {
+                                cosmic::Action::App(Message::NetworkDriveOpenTabAfterMount {
+                                    location: location.clone(),
+                                })
+                            } else {
+                                cosmic::action::none()
+                            }
+                        });
+                }
+            }
+            Message::NetworkDriveForget(uri) => {
+                let mut drives = self.config.saved_network_drives.clone();
+                drives.retain(|d| d.uri != uri);
+                self.save_network_drives(drives);
+                self.update_nav_model();
+            }
+            Message::NetworkDriveForgetAll => {
+                self.save_network_drives(Vec::new());
+                self.update_nav_model();
+            }
             Message::NetworkDriveInput(input) => {
                 self.network_drive_input = input;
             }
@@ -3576,8 +3742,12 @@ impl Application for App {
                 if let Some((mounter_key, mounter)) = MOUNTERS.iter().next() {
                     self.network_drive_connecting =
                         Some((*mounter_key, self.network_drive_input.clone()));
+                    let uri = self.network_drive_input.clone();
+                    if !self.network_drive_submitted.contains(&uri) {
+                        self.network_drive_submitted.push(uri);
+                    }
                     return mounter
-                        .network_drive(self.network_drive_input.clone())
+                        .network_drive(self.network_drive_input.clone(), false)
                         .map(|_| cosmic::action::none());
                 }
                 log::warn!(
@@ -3596,14 +3766,27 @@ impl Application for App {
                 match res {
                     Ok(true) => {
                         log::info!("connected to {uri:?}");
+                        if let Some(i) = self.network_drive_submitted.iter().position(|u| *u == uri)
+                        {
+                            self.network_drive_submitted.remove(i);
+                            let normalized = normalize_network_uri(&uri);
+                            let mut drives = self.config.saved_network_drives.clone();
+                            if !drives.iter().any(|d| d.uri == normalized) {
+                                drives.push(SavedNetworkDrive::new(&uri));
+                                self.save_network_drives(drives);
+                            }
+                        }
+                        self.update_nav_model();
                         if matches!(self.context_page, ContextPage::NetworkDrive) {
                             self.set_show_context(false);
                         }
                     }
                     Ok(false) => {
+                        self.network_drive_submitted.retain(|u| *u != uri);
                         log::info!("cancelled connection to {uri:?}");
                     }
                     Err(error) => {
+                        self.network_drive_submitted.retain(|u| *u != uri);
                         log::warn!("failed to connect to {uri:?}: {error}");
                         return self.dialog_pages.push_back(DialogPage::NetworkError {
                             mounter_key,
@@ -5169,6 +5352,13 @@ impl Application for App {
                     }
                 }
 
+                NavMenuAction::ForgetNetworkDrive(entity) => {
+                    if let Some(SavedNetworkData(uri)) =
+                        self.nav_model.data::<SavedNetworkData>(entity)
+                    {
+                        return self.update(Message::NetworkDriveForget(uri.clone()));
+                    }
+                }
                 NavMenuAction::ChangeSidebarLabel(entity) => {
                     if let Some(favorite) = self.nav_model.data::<FavoriteIndex>(entity).and_then(
                         |FavoriteIndex(favorite_i)| self.config.favorites.get(*favorite_i),
