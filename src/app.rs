@@ -1,6 +1,7 @@
 // Copyright 2023 System76 <info@system76.com>
 // SPDX-License-Identifier: GPL-3.0-only
 
+use crate::bulk_rename;
 use crate::scan::has_recents;
 use crate::trash::TrashItem;
 use cosmic::app::{self, Core, Task, context_drawer};
@@ -522,6 +523,10 @@ impl AsRef<str> for ArchiveType {
 
 #[derive(Clone, Debug)]
 pub enum DialogPage {
+    BulkRename {
+        entries: Arc<[bulk_rename::Entry]>,
+        settings: bulk_rename::Settings,
+    },
     Compress {
         paths: Box<[PathBuf]>,
         to: PathBuf,
@@ -1354,6 +1359,10 @@ impl App {
                 // If a favorite for a path has been renamed or moved, update it.
                 if let Operation::Rename { ref from, ref to } = op {
                     if self.update_favorites([(from, to)].as_slice()) {
+                        commands.push(self.update_config());
+                    }
+                } else if let Operation::BulkRename { ref renames } = op {
+                    if self.update_favorites(renames.as_slice()) {
                         commands.push(self.update_config());
                     }
                 } else if let Operation::Move {
@@ -3240,6 +3249,24 @@ impl Application for App {
                                 }
                             }
                         }
+                        DialogPage::BulkRename { entries, settings } => {
+                            let rows = bulk_rename::plan(&entries, &settings, |p| p.exists());
+                            if rows.iter().any(|row| row.error.is_some()) {
+                                log::warn!("bulk rename completed with invalid names");
+                            } else {
+                                let renames: Vec<_> = entries
+                                    .iter()
+                                    .zip(&rows)
+                                    .filter(|(_, row)| row.changed())
+                                    .map(|(entry, row)| {
+                                        (entry.path.clone(), entry.path.with_file_name(&row.new))
+                                    })
+                                    .collect();
+                                if !renames.is_empty() {
+                                    tasks.push(self.operation(Operation::BulkRename { renames }));
+                                }
+                            }
+                        }
                         DialogPage::RenameItem {
                             from, parent, name, ..
                         } => {
@@ -4243,8 +4270,23 @@ impl Application for App {
                             }
                         })
                         .collect();
+                    if selected.len() > 1 {
+                        let entries: Arc<[_]> = selected
+                            .iter()
+                            .map(|path| bulk_rename::Entry {
+                                path: path.clone(),
+                                dir: path.is_dir(),
+                            })
+                            .collect();
+                        return Task::batch([
+                            self.dialog_pages.push_back(DialogPage::BulkRename {
+                                entries,
+                                settings: bulk_rename::Settings::default(),
+                            }),
+                            widget::text_input::focus(self.dialog_text_input.clone()),
+                        ]);
+                    }
                     if !selected.is_empty() {
-                        //TODO: batch rename
                         let mut last_name = String::new();
                         let tasks: Vec<_> = selected
                             .into_iter()
@@ -4763,9 +4805,10 @@ impl Application for App {
                             for path in &*recently_trashed {
                                 for item in &items {
                                     if let ItemMetadata::Trash { ref entry, .. } = item.metadata
-                                        && &entry.original_path == path {
-                                            paths.push(entry.clone());
-                                        }
+                                        && &entry.original_path == path
+                                    {
+                                        paths.push(entry.clone());
+                                    }
                                 }
                             }
                         }
@@ -5475,6 +5518,9 @@ impl Application for App {
         } = theme::spacing();
 
         let dialog = match dialog_page {
+            DialogPage::BulkRename { entries, settings } => {
+                bulk_rename_dialog(entries, settings, self.dialog_text_input.clone())
+            }
             DialogPage::Compress {
                 paths,
                 to,
@@ -6974,6 +7020,86 @@ impl Application for App {
 
         Subscription::batch(subscriptions)
     }
+}
+
+fn bulk_rename_edit(
+    entries: &Arc<[bulk_rename::Entry]>,
+    settings: &bulk_rename::Settings,
+    f: fn(&mut bulk_rename::Settings, String),
+) -> impl Fn(String) -> Message + 'static {
+    let entries = entries.clone();
+    let settings = settings.clone();
+    move |value| {
+        let mut settings = settings.clone();
+        f(&mut settings, value);
+        Message::DialogUpdate(DialogPage::BulkRename {
+            entries: entries.clone(),
+            settings,
+        })
+    }
+}
+
+fn bulk_rename_dialog<'a>(
+    entries: &'a Arc<[bulk_rename::Entry]>,
+    settings: &'a bulk_rename::Settings,
+    input_id: widget::Id,
+) -> widget::Dialog<'a, Message> {
+    use bulk_rename::RowError;
+
+    let cosmic_theme::Spacing { space_xxs, .. } = theme::spacing();
+
+    let rows = bulk_rename::plan(entries, settings, |p| p.exists());
+    let valid = rows.iter().all(|row| row.error.is_none()) && rows.iter().any(|row| row.changed());
+    let submit = valid.then_some(Message::DialogComplete);
+
+    let name_input = widget::text_input("", settings.name.clone())
+        .id(input_id)
+        .on_input(bulk_rename_edit(entries, settings, |s, v| s.name = v))
+        .on_submit_maybe(submit.clone().map(|m| move |_| m.clone()));
+    let start_input = widget::text_input("", settings.start.clone())
+        .on_input(bulk_rename_edit(entries, settings, |s, v| s.start = v))
+        .on_submit_maybe(submit.clone().map(|m| move |_| m.clone()));
+
+    let digits_input = widget::text_input("", settings.digits.clone())
+        .on_input(bulk_rename_edit(entries, settings, |s, v| s.digits = v))
+        .on_submit_maybe(submit.clone().map(|m| move |_| m.clone()));
+
+    let mut preview = widget::column::with_capacity(rows.len()).spacing(space_xxs);
+    for row in &rows {
+        let text = match row.error {
+            None => format!("{}  →  {}", row.old, row.new),
+            Some(error) => {
+                let reason = match error {
+                    RowError::Empty => fl!("bulk-rename-error-empty"),
+                    RowError::Slashes => fl!("bulk-rename-error-slashes"),
+                    RowError::Exists => fl!("bulk-rename-error-exists"),
+                };
+                format!("{}  →  {}  ({reason})", row.old, row.new)
+            }
+        };
+        preview = preview.push(widget::text::body(text));
+    }
+
+    widget::dialog()
+        .title(fl!("bulk-rename-title", items = entries.len()))
+        .primary_action(widget::button::suggested(fl!("rename-confirm")).on_press_maybe(submit))
+        .secondary_action(widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel))
+        .control(
+            widget::column::with_children([
+                widget::text::body(fl!("bulk-rename-name")).into(),
+                name_input.into(),
+                widget::text::body(fl!("bulk-rename-start")).into(),
+                start_input.into(),
+                widget::text::body(fl!("bulk-rename-digits")).into(),
+                digits_input.into(),
+                widget::text::heading(fl!("bulk-rename-preview")).into(),
+                widget::scrollable(preview)
+                    .height(Length::Fixed(180.0))
+                    .width(Length::Fill)
+                    .into(),
+            ])
+            .spacing(space_xxs),
+        )
 }
 
 // Utilities to build a temporary file hierarchy for tests.

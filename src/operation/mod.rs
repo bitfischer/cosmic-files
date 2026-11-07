@@ -420,6 +420,10 @@ pub enum Operation {
         from: PathBuf,
         to: PathBuf,
     },
+    /// Rename multiple items at once, safely handling swaps and chains
+    BulkRename {
+        renames: Vec<(PathBuf, PathBuf)>,
+    },
     /// Restore a path from the trash
     Restore {
         items: Vec<TrashItem>,
@@ -558,6 +562,7 @@ impl Operation {
             Self::Rename { from, to } => {
                 fl!("renaming", from = file_name(from), to = file_name(to))
             }
+            Self::BulkRename { renames } => fl!("bulk-renaming", items = renames.len()),
             Self::RemoveFromRecents { paths } => fl!("removing-from-recents", items = paths.len()),
             Self::Restore { items } => fl!("restoring", items = items.len(), progress = progress()),
             Self::SetExecutableAndLaunch { path } => {
@@ -624,6 +629,7 @@ impl Operation {
             Self::PermanentlyDelete { paths } => fl!("permanently-deleted", items = paths.len()),
             Self::RemoveFromRecents { paths } => fl!("removed-from-recents", items = paths.len()),
             Self::Rename { from, to } => fl!("renamed", from = file_name(from), to = file_name(to)),
+            Self::BulkRename { renames } => fl!("bulk-renamed", items = renames.len()),
             Self::Restore { items } => fl!("restored", items = items.len()),
             Self::SetExecutableAndLaunch { path } => {
                 fl!("set-executable-and-launched", name = file_name(path))
@@ -654,6 +660,7 @@ impl Operation {
             | Self::NewFolder { .. }
             | Self::RemoveFromRecents { .. }
             | Self::Rename { .. }
+            | Self::BulkRename { .. }
             | Self::SetExecutableAndLaunch { .. }
             | Self::SetPermissions { .. } => false,
         }
@@ -1134,6 +1141,19 @@ impl Operation {
             }
             .await
             .map_err(wrap_compio_spawn_error)?,
+            Self::BulkRename { renames } => {
+                let controller_err = controller.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::bulk_rename::perform(&renames)?;
+                    Ok(OperationSelection {
+                        ignored: renames.iter().map(|(from, _)| from.clone()).collect(),
+                        selected: renames.into_iter().map(|(_, to)| to).collect(),
+                    })
+                })
+                .await
+                .map_err(|e| OperationError::from_err(e, &controller_err))?
+                .map_err(|e: std::io::Error| OperationError::from_err(e, &controller_err))
+            }
             Self::Restore { items } => {
                 let total = items.len();
                 let mut paths = Vec::with_capacity(total);

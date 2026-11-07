@@ -118,6 +118,16 @@ rename-file = Rename file
 rename-folder = Rename folder
 rename-confirm = Rename
 
+## Bulk Rename Dialog
+bulk-rename-title = Rename {$items} items
+bulk-rename-name = New name (a number is added to it)
+bulk-rename-start = Start numbering at
+bulk-rename-digits = Minimum digits (e.g. 3 gives 001, 002)
+bulk-rename-preview = Preview
+bulk-rename-error-empty = Name cannot be empty
+bulk-rename-error-slashes = Name cannot contain slashes
+bulk-rename-error-exists = A file or folder with that name already exists
+
 ## Change Sidebar Label Dialog
 sidebar-label = Sidebar label
 
@@ -283,6 +293,14 @@ removed-from-recents = Removed {$items} {$items ->
     } from {recents}
 renaming = Renaming "{$from}" to "{$to}"
 renamed = Renamed "{$from}" to "{$to}"
+bulk-renaming = Renaming {$items} {$items ->
+        [one] item
+        *[other] items
+    }...
+bulk-renamed = Renamed {$items} {$items ->
+        [one] item
+        *[other] items
+    }
 restoring = Restoring {$items} {$items ->
         [one] item
         *[other] items
