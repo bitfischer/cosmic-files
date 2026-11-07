@@ -127,6 +127,11 @@ impl Location {
     }
 
     pub fn ancestors(&self) -> Vec<(Self, String)> {
+        // Looking up ancestor names stats every path, which blocks while a network
+        // server is unreachable
+        if matches!(self, Self::Network(..)) {
+            return Vec::new();
+        }
         self.path_opt().map_or_else(Default::default, |path| {
             path.ancestors()
                 .scan(false, |found_home, ancestor| {

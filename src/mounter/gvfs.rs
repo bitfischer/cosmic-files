@@ -28,6 +28,64 @@ standard::icon,\
 standard::is-hidden,\
 time::modified";
 
+/// Longest the UI waits for directory info of a (possibly unreachable) location
+const DIR_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// URIs of mounted remote drives that did not answer the last reachability probe.
+/// gvfs keeps mounts listed after their server goes away.
+static UNREACHABLE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// How long a mounted remote drive may take to answer a reachability probe
+const PROBE_TIMEOUT_SECS: u32 = 5;
+
+/// Asynchronously check that mounted remote drives still answer, and trigger a rescan
+/// if the reachability of any drive changed. Never blocks the calling thread.
+fn probe_mounts(
+    monitor: &gio::VolumeMonitor,
+    event_tx: &std::sync::Weak<crate::channel::Sender<Event>>,
+) {
+    for mount in monitor.mounts() {
+        if mount.is_shadowed() {
+            continue;
+        }
+        let root = MountExt::root(&mount);
+        if root.is_native() {
+            continue;
+        }
+        let uri = String::from(root.uri());
+        let cancellable = gio::Cancellable::new();
+        {
+            let cancellable = cancellable.clone();
+            glib::timeout_add_seconds_local_once(PROBE_TIMEOUT_SECS, move || cancellable.cancel());
+        }
+        let event_tx = event_tx.clone();
+        root.query_info_async(
+            gio::FILE_ATTRIBUTE_STANDARD_TYPE,
+            gio::FileQueryInfoFlags::NONE,
+            glib::Priority::DEFAULT,
+            Some(&cancellable),
+            move |res| {
+                let reachable = res.is_ok();
+                let changed = {
+                    let mut unreachable = UNREACHABLE.lock().unwrap();
+                    if reachable {
+                        unreachable.remove(&uri)
+                    } else {
+                        unreachable.insert(uri.clone())
+                    }
+                };
+                if changed {
+                    log::info!("network drive {uri} reachable: {reachable}");
+                    if let Some(event_tx) = event_tx.upgrade() {
+                        event_tx.send(Event::Changed);
+                    }
+                }
+            },
+        );
+    }
+}
+
 fn resolve_uri(uri: &str) -> (String, gio::File) {
     let file = gio::File::for_uri(uri);
     // Resolve the target-uri if it exists
@@ -65,17 +123,26 @@ fn items(monitor: &gio::VolumeMonitor, sizes: IconSizes) -> MounterItems {
         .filter(|(_, mount)| !mount.is_shadowed())
         .map(|(i, mount)| {
             let root = MountExt::root(&mount);
-            let is_remote = root
-                .query_filesystem_info(
+            // Non-native roots (smb://, sftp://, ...) are always remote. Querying them
+            // here would block this thread, and with it every other gvfs command,
+            // until an unreachable server times out. Only native roots (such as
+            // kernel NFS/CIFS mounts) need the filesystem query.
+            let is_remote = if root.is_native() {
+                root.query_filesystem_info(
                     gio::FILE_ATTRIBUTE_FILESYSTEM_REMOTE,
                     gio::Cancellable::NONE,
                 )
                 .ok()
                 .map(|info| info.boolean(gio::FILE_ATTRIBUTE_FILESYSTEM_REMOTE))
-                .unwrap_or(true); // Default to remote if query fails
+                .unwrap_or(true) // Default to remote if query fails
+            } else {
+                true
+            };
 
+            let uri: String = mount.root().uri().into();
             MounterItem::Gvfs(GvfsItem {
-                uri: mount.root().uri().into(),
+                is_reachable: !UNREACHABLE.lock().unwrap().contains(&uri),
+                uri,
                 kind: ItemKind::Mount,
                 index: i,
                 name: mount.name().into(),
@@ -104,6 +171,7 @@ fn items(monitor: &gio::VolumeMonitor, sizes: IconSizes) -> MounterItems {
                     name: volume.name().into(),
                     is_mounted: false,
                     is_remote: false,
+                    is_reachable: true,
                     icon_opt: gio_icon_to_path(&VolumeExt::icon(&volume), sizes.grid()),
                     icon_symbolic_opt: gio_icon_to_path(&VolumeExt::symbolic_icon(&volume), 16),
                     path_opt: None,
@@ -315,6 +383,7 @@ fn mount_op(
 enum Cmd {
     Items(IconSizes, mpsc::Sender<MounterItems>),
     Rescan,
+    Probe,
     Mount(
         MounterItem,
         tokio::sync::oneshot::Sender<anyhow::Result<()>>,
@@ -325,10 +394,6 @@ enum Cmd {
         tokio::sync::oneshot::Sender<anyhow::Result<()>>,
     ),
     NetworkScan(String, IconSizes, mpsc::Sender<Result<Vec<Item>, String>>),
-    DirInfo(
-        String,
-        mpsc::Sender<Result<(String, String, Option<PathBuf>), glib::Error>>,
-    ),
     Unmount(MounterItem),
 }
 
@@ -356,6 +421,7 @@ pub struct GvfsItem {
     name: String,
     is_mounted: bool,
     is_remote: bool,
+    is_reachable: bool,
     icon_opt: Option<PathBuf>,
     icon_symbolic_opt: Option<PathBuf>,
     path_opt: Option<PathBuf>,
@@ -372,6 +438,10 @@ impl GvfsItem {
 
     pub const fn is_remote(&self) -> bool {
         self.is_remote
+    }
+
+    pub const fn is_reachable(&self) -> bool {
+        self.is_reachable
     }
 
     pub fn uri(&self) -> String {
@@ -403,6 +473,7 @@ impl Gvfs {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = crate::channel::channel();
         let event_tx = Arc::new(event_tx);
+        let probe_tx = command_tx.clone();
         std::thread::spawn(move || {
             let main_loop = glib::MainLoop::new(None, false);
             main_loop.context().spawn_local(async move {
@@ -482,6 +553,15 @@ impl Gvfs {
                     }
                 };
 
+                // Periodically check that mounted network drives are still reachable
+                glib::timeout_add_seconds_local(30, move || {
+                    if probe_tx.send(Cmd::Probe).is_ok() {
+                        glib::ControlFlow::Continue
+                    } else {
+                        glib::ControlFlow::Break
+                    }
+                });
+
                 while let Some(command) = command_rx.recv().await {
                     match command {
                         Cmd::Items(sizes, items_tx) => {
@@ -493,6 +573,10 @@ impl Gvfs {
                             };
 
                             event_tx.send(Event::Items(items(&monitor, IconSizes::default())));
+                            probe_mounts(&monitor, &Arc::downgrade(&event_tx));
+                        }
+                        Cmd::Probe => {
+                            probe_mounts(&monitor, &event_tx);
                         }
                         Cmd::Mount(mounter_item, complete_tx) => {
                             let MounterItem::Gvfs(ref item) = mounter_item else {
@@ -592,45 +676,54 @@ impl Gvfs {
                             );
                         }
                         Cmd::NetworkScan(uri, sizes, items_tx) => {
-                            let (resolved_uri, file) = resolve_uri(&uri);
+                            // Querying and scanning a network location blocks until an
+                            // unreachable server times out. Do it on a worker thread so the
+                            // gvfs thread keeps serving other commands.
+                            let event_tx = event_tx.clone();
+                            std::thread::spawn(move || {
+                                let (resolved_uri, file) = resolve_uri(&uri);
 
-                            let needs_mount = resolved_uri != "network:///" && match file.find_enclosing_mount(gio::Cancellable::NONE) {
-                                Ok(_) => false,
-                                Err(err) => matches!(err.kind::<gio::IOErrorEnum>(), Some(gio::IOErrorEnum::NotMounted))
-                            };
+                                let needs_mount = resolved_uri != "network:///" && match file.find_enclosing_mount(gio::Cancellable::NONE) {
+                                    Ok(_) => false,
+                                    Err(err) => matches!(err.kind::<gio::IOErrorEnum>(), Some(gio::IOErrorEnum::NotMounted))
+                                };
 
-                            if needs_mount {
-                                let mount_op = mount_op(resolved_uri.clone(), false, event_tx.clone());
-                                let event_tx = event_tx.clone();
-                                file.mount_enclosing_volume(
-                                    gio::MountMountFlags::empty(),
-                                    Some(&mount_op),
-                                    gio::Cancellable::NONE,
-                                    move |res| {
-                                        log::info!("network scan mounted {resolved_uri}: result {res:?}");
-                                        // FIXME sometimes a uri can be mounted and then not recognized as mounted...
-                                        // seems to be related to uri with a path
-                                        items_tx.blocking_send(network_scan(&uri, sizes)).unwrap();
-                                        let Some(event_tx) = event_tx.upgrade() else {
-                                            return;
-                                        };
-                                        event_tx.send(Event::NetworkResult(resolved_uri, match res {
-                                            Ok(()) => {
-                                                Ok(true)
-                                            },
-                                            Err(err) => match err.kind::<gio::IOErrorEnum>() {
-                                                Some(gio::IOErrorEnum::FailedHandled) => Ok(false),
-                                                _ => Err(format!("{err}"))
-                                            }
-                                        }));
-                                    }
-                                );
-                            } else {
-                                items_tx.send(network_scan(&uri, sizes)).await.unwrap();
-                            }
-                        }
-                        Cmd::DirInfo(uri, result_tx) => {
-                            result_tx.send(dir_info(&uri)).await.unwrap();
+                                if !needs_mount {
+                                    _ = items_tx.blocking_send(network_scan(&uri, sizes));
+                                    return;
+                                }
+
+                                // Mounting needs the gvfs thread's main context
+                                glib::MainContext::default().invoke(move || {
+                                    let file = gio::File::for_uri(&resolved_uri);
+                                    let mount_op = mount_op(resolved_uri.clone(), false, event_tx.clone());
+                                    file.mount_enclosing_volume(
+                                        gio::MountMountFlags::empty(),
+                                        Some(&mount_op),
+                                        gio::Cancellable::NONE,
+                                        move |res| {
+                                            log::info!("network scan mounted {resolved_uri}: result {res:?}");
+                                            // FIXME sometimes a uri can be mounted and then not recognized as mounted...
+                                            // seems to be related to uri with a path
+                                            std::thread::spawn(move || {
+                                                _ = items_tx.blocking_send(network_scan(&uri, sizes));
+                                            });
+                                            let Some(event_tx) = event_tx.upgrade() else {
+                                                return;
+                                            };
+                                            event_tx.send(Event::NetworkResult(resolved_uri, match res {
+                                                Ok(()) => {
+                                                    Ok(true)
+                                                },
+                                                Err(err) => match err.kind::<gio::IOErrorEnum>() {
+                                                    Some(gio::IOErrorEnum::FailedHandled) => Ok(false),
+                                                    _ => Err(format!("{err}"))
+                                                }
+                                            }));
+                                        }
+                                    );
+                                });
+                            });
                         }
                         Cmd::Unmount(mounter_item) => {
                             let MounterItem::Gvfs(item) = mounter_item else { continue };
@@ -739,11 +832,14 @@ impl Mounter for Gvfs {
     }
 
     fn dir_info(&self, uri: &str) -> Option<(String, String, Option<PathBuf>)> {
-        let (result_tx, mut result_rx) = mpsc::channel(1);
-        self.command_tx
-            .send(Cmd::DirInfo(uri.to_string(), result_tx))
-            .unwrap();
-        result_rx.blocking_recv().and_then(|res| res.ok())
+        // Query on a separate thread: gio calls block until an unreachable server
+        // times out, which must neither stall the gvfs thread nor the UI for long.
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let uri = uri.to_string();
+        std::thread::spawn(move || {
+            _ = result_tx.send(dir_info(&uri).ok());
+        });
+        result_rx.recv_timeout(DIR_INFO_TIMEOUT).ok().flatten()
     }
 
     fn unmount(&self, item: MounterItem) -> Task<()> {

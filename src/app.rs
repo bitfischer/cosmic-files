@@ -1737,6 +1737,27 @@ impl App {
         })
     }
 
+    /// Whether a network location belongs to a currently mounted network drive.
+    /// Does not touch the filesystem.
+    fn is_network_path_mounted(&self, uri: &str, path: &Path) -> bool {
+        let key = network_uri_server_key(uri);
+        self.mounter_items.values().flatten().any(|item| {
+            item.is_mounted()
+                && (item.path().is_some_and(|p| path.starts_with(&p))
+                    || network_uri_server_key(&item.uri()) == key)
+        })
+    }
+
+    /// Paths of mounted remote drives, which must not be touched on the UI thread
+    fn remote_mount_paths(&self) -> Vec<PathBuf> {
+        self.mounter_items
+            .values()
+            .flatten()
+            .filter(|item| item.is_mounted() && item.is_remote())
+            .filter_map(MounterItem::path)
+            .collect()
+    }
+
     fn save_network_drives(&mut self, drives: Vec<SavedNetworkDrive>) {
         match &self.config_handler {
             Some(config_handler) => {
@@ -1784,10 +1805,12 @@ impl App {
         for (favorite_i, favorite) in self.config.favorites.iter().enumerate() {
             if let Some(path) = favorite.path_opt() {
                 let name = favorite.display_name().unwrap_or_else(|| fl!("filesystem"));
+                // Never stat network paths here, it blocks while the server is unreachable
+                let is_network = matches!(favorite, Favorite::Network { .. });
                 nav_model = nav_model.insert(move |b| {
                     b.text(name.clone())
                         .icon(
-                            icon::icon(if path.is_dir() {
+                            icon::icon(if is_network || path.is_dir() {
                                 folder_icon_symbolic(&path, 16)
                             } else {
                                 icon::from_name("text-x-generic-symbolic").size(16).handle()
@@ -1851,7 +1874,12 @@ impl App {
                 } else if !uri.is_empty() {
                     b = b.data(Location::Network(uri, item.name(), None));
                 }
-                if let Some(icon) = item.icon(true) {
+                if item.is_mounted() && !item.is_reachable() {
+                    // gvfs keeps mounts listed after the server went away
+                    b = b.icon(icon::icon(
+                        icon::from_name("network-offline-symbolic").size(16).handle(),
+                    ));
+                } else if let Some(icon) = item.icon(true) {
                     b = b.icon(icon::icon(icon).size(16));
                 }
                 if item.is_mounted() {
@@ -1930,12 +1958,19 @@ impl App {
 
     fn update_watcher(&mut self) -> Task<Message> {
         if let Some((mut watcher, old_paths)) = self.watcher_opt.take() {
+            // Watching a path on an unreachable network drive blocks the UI thread,
+            // and gvfs paths do not support change notifications anyway
+            let remote_paths = self.remote_mount_paths();
             let new_paths: FxHashSet<_> = self
                 .tab_model
                 .iter()
                 .filter_map(|entity| {
                     let tab = self.tab_model.data::<Tab>(entity)?;
-                    tab.location.path_opt().cloned()
+                    if matches!(tab.location, Location::Network(..)) {
+                        return None;
+                    }
+                    let path = tab.location.path_opt()?;
+                    (!remote_paths.iter().any(|p| path.starts_with(p))).then(|| path.clone())
                 })
                 .collect();
 
@@ -2649,10 +2684,15 @@ impl Application for App {
                 return items;
             }
 
-            if location_opt
-                .and_then(Location::path_opt)
-                .is_some_and(|x| x.is_file())
-            {
+            // This menu is rebuilt for every nav entry on each view. Only stat the entry the
+            // menu is opened for, and never network paths, since stat blocks the UI thread
+            // while a server is unreachable.
+            let stat_path_opt = (entity == self.nav_bar_context_id
+                && matches!(location_opt, Some(Location::Path(_))))
+            .then(|| location_opt.and_then(Location::path_opt))
+            .flatten();
+
+            if stat_path_opt.is_some_and(|x| x.is_file()) {
                 items.push(cosmic::widget::menu::Item::Button(
                     fl!("open"),
                     None,
@@ -2675,8 +2715,8 @@ impl Application for App {
                     NavMenuAction::OpenInNewWindow(entity),
                 ));
             }
-            if let Some(path) = location_opt.and_then(Location::path_opt) {
-                let selected_dir = usize::from(path.is_dir());
+            if location_opt.and_then(Location::path_opt).is_some() {
+                let selected_dir = usize::from(stat_path_opt.is_none_or(|x| x.is_dir()));
                 let action_items: Vec<_> = self
                     .config
                     .context_actions
@@ -2759,7 +2799,7 @@ impl Application for App {
             let should_open = match location {
                 #[cfg(feature = "gvfs")]
                 Location::Network(uri, name, Some(path))
-                    if !path.try_exists().unwrap_or_default() =>
+                    if !self.is_network_path_mounted(uri, path) =>
                 {
                     let mut found = false;
 
@@ -2805,7 +2845,10 @@ impl Application for App {
                         Some(FAVORITE_PATH_ERROR_REMOVE_BUTTON_ID.clone()),
                     );
                 }
-                Location::Path(path) | Location::Network(_, _, Some(path)) => {
+                // Never stat network paths here, it blocks while the server is unreachable.
+                // Opening the location reports an error if it can't be read.
+                Location::Network(..) => true,
+                Location::Path(path) => {
                     match path.try_exists() {
                         Ok(true) => true,
                         Ok(false) => {

@@ -2616,7 +2616,11 @@ impl Tab {
             } else {
                 // Select parent if location is not directory
                 let mut selected_paths = None;
+                // Never stat network locations here, it blocks the UI thread while the
+                // server is unreachable. Scanning the location reports any error.
+                let is_network = matches!(location, Location::Network(..));
                 if let Some(path) = location.path_opt()
+                    && !is_network
                     && !path.is_dir()
                     && let Some(parent) = path.parent()
                 {
@@ -2624,7 +2628,7 @@ impl Tab {
                     location = location.with_path(parent.to_path_buf());
                 }
                 if location != self.location || selected_paths.is_some() {
-                    if location.path_opt().is_none_or(|path| path.is_dir()) {
+                    if is_network || location.path_opt().is_none_or(|path| path.is_dir()) {
                         if selected_paths.is_none() {
                             selected_paths =
                                 self.location.path_opt().map(|path| vec![path.clone()]);

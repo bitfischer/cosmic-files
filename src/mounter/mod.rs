@@ -91,6 +91,15 @@ impl MounterItem {
         }
     }
 
+    /// False for a mounted network drive whose server stopped answering
+    pub fn is_reachable(&self) -> bool {
+        match self {
+            #[cfg(feature = "gvfs")]
+            Self::Gvfs(item) => item.is_reachable(),
+            Self::None => true,
+        }
+    }
+
     pub fn is_remote(&self) -> bool {
         match self {
             #[cfg(feature = "gvfs")]
