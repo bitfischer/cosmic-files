@@ -29,6 +29,7 @@ mod localize;
 pub mod location;
 mod menu;
 mod mime_app;
+pub mod mime_description;
 pub mod mime_icon;
 mod mounter;
 mod mouse_area;

@@ -309,6 +309,7 @@ pub fn context_menu(
                 children.push(sort_item(fl!("sort-by-name"), HeadingOptions::Name));
                 children.push(sort_item(fl!("sort-by-modified"), HeadingOptions::Modified));
                 children.push(sort_item(fl!("sort-by-size"), HeadingOptions::Size));
+                children.push(sort_item(fl!("sort-by-type"), HeadingOptions::Type));
                 if matches!(tab.location, Location::Desktop(..)) {
                     children.push(menu::Item::Divider);
                     children.push(menu_item(
@@ -352,6 +353,7 @@ pub fn context_menu(
                 children.push(sort_item(fl!("sort-by-name"), HeadingOptions::Name));
                 children.push(sort_item(fl!("sort-by-modified"), HeadingOptions::Modified));
                 children.push(sort_item(fl!("sort-by-size"), HeadingOptions::Size));
+                children.push(sort_item(fl!("sort-by-type"), HeadingOptions::Type));
             }
         }
         (_, Location::Network(..)) => {
@@ -369,6 +371,7 @@ pub fn context_menu(
                 children.push(sort_item(fl!("sort-by-name"), HeadingOptions::Name));
                 children.push(sort_item(fl!("sort-by-modified"), HeadingOptions::Modified));
                 children.push(sort_item(fl!("sort-by-size"), HeadingOptions::Size));
+                children.push(sort_item(fl!("sort-by-type"), HeadingOptions::Type));
             }
         }
         (_, Location::Trash | Location::Search(SearchLocation::Trash, ..)) => {
@@ -392,6 +395,7 @@ pub fn context_menu(
                 children.push(sort_item(fl!("sort-by-name"), HeadingOptions::Name));
                 children.push(sort_item(fl!("sort-by-trashed"), HeadingOptions::TrashedOn));
                 children.push(sort_item(fl!("sort-by-size"), HeadingOptions::Size));
+                children.push(sort_item(fl!("sort-by-type"), HeadingOptions::Type));
             }
         }
     }
@@ -501,7 +505,8 @@ pub fn dialog_menu(
                         tab::HeadingOptions::Size,
                         false,
                     ),
-                    //TODO: sort by type
+                    sort_item(fl!("sort-type-a-z"), tab::HeadingOptions::Type, true),
+                    sort_item(fl!("sort-type-z-a"), tab::HeadingOptions::Type, false),
                 ],
             ),
         ),
@@ -742,7 +747,8 @@ pub fn menu_bar<'a>(
                             tab::HeadingOptions::Size,
                             false,
                         ),
-                        //TODO: sort by type
+                        sort_item(fl!("sort-type-a-z"), tab::HeadingOptions::Type, true),
+                        sort_item(fl!("sort-type-z-a"), tab::HeadingOptions::Type, false),
                     ],
                 ),
             ],

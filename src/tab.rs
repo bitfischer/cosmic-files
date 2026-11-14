@@ -76,6 +76,9 @@ pub const THUMBNAIL_SIZE: u32 = (ICON_SIZE_GRID as u32) * (ICON_SCALE_MAX as u32
 pub static THUMB_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::const_new(num_cpus::get().min(4)));
 
+/// Width of the "Type" column in list view
+const TYPE_COLUMN_WIDTH: f32 = 150.0;
+
 pub(crate) static SORT_OPTION_FALLBACK: LazyLock<FxHashMap<String, (HeadingOptions, bool)>> =
     LazyLock::new(|| {
         FxHashMap::from_iter(dirs::download_dir().into_iter().map(|dir| {
@@ -464,6 +467,7 @@ pub enum HeadingOptions {
     Modified,
     Size,
     TrashedOn,
+    Type,
 }
 
 impl fmt::Display for HeadingOptions {
@@ -473,6 +477,7 @@ impl fmt::Display for HeadingOptions {
             Self::Modified => write!(f, "{}", fl!("modified")),
             Self::Size => write!(f, "{}", fl!("size")),
             Self::TrashedOn => write!(f, "{}", fl!("trashed-on")),
+            Self::Type => write!(f, "{}", fl!("file-type")),
         }
     }
 }
@@ -484,6 +489,7 @@ impl HeadingOptions {
             Self::Modified.to_string(),
             Self::Size.to_string(),
             Self::TrashedOn.to_string(),
+            Self::Type.to_string(),
         ]
     }
 }
@@ -2740,6 +2746,33 @@ impl Tab {
                     }
                 });
             }
+            HeadingOptions::Type => {
+                // Look up each label once, not on every comparison
+                let labels: Vec<String> = self
+                    .items_opt
+                    .as_ref()?
+                    .iter()
+                    .map(Item::type_text)
+                    .collect();
+                items.sort_by(|a, b| {
+                    let by_type = || {
+                        LANGUAGE_SORTER
+                            .compare(&labels[a.0], &labels[b.0])
+                            .then_with(|| {
+                                LANGUAGE_SORTER.compare(&a.1.display_name, &b.1.display_name)
+                            })
+                    };
+                    if folders_first {
+                        match (a.1.metadata.is_dir(), b.1.metadata.is_dir()) {
+                            (true, false) => Ordering::Less,
+                            (false, true) => Ordering::Greater,
+                            _ => check_reverse(by_type(), sort_direction),
+                        }
+                    } else {
+                        check_reverse(by_type(), sort_direction)
+                    }
+                });
+            }
             HeadingOptions::TrashedOn => {
                 let time_deleted = |x: &Item| match &x.metadata {
                     ItemMetadata::Trash { entry, .. } => entry.time_deleted,
@@ -3054,7 +3087,10 @@ impl Tab {
         let name_width = 300.0;
         let modified_width = 200.0;
         let size_width = 100.0;
+        let type_width = TYPE_COLUMN_WIDTH;
         let condensed = size.width < (name_width + modified_width + size_width);
+        // The type column is the first one to go when space is short
+        let show_type = size.width >= (name_width + modified_width + size_width + type_width);
 
         let (sort_name, sort_direction, _) = self.sort_options();
         let heading_item = |name, width, msg| {
@@ -3078,23 +3114,33 @@ impl Tab {
                 .into()
         };
 
-        let heading_row = widget::row::with_children([
-            heading_item(fl!("name"), Length::Fill, HeadingOptions::Name),
-            if self.location.is_trash() {
+        let heading_row = widget::row::with_children(
+            [
+                heading_item(fl!("name"), Length::Fill, HeadingOptions::Name),
+                if self.location.is_trash() {
+                    heading_item(
+                        fl!("trashed-on"),
+                        Length::Fixed(modified_width),
+                        HeadingOptions::TrashedOn,
+                    )
+                } else {
+                    heading_item(
+                        fl!("modified"),
+                        Length::Fixed(modified_width),
+                        HeadingOptions::Modified,
+                    )
+                },
+                heading_item(fl!("size"), Length::Fixed(size_width), HeadingOptions::Size),
+            ]
+            .into_iter()
+            .chain(show_type.then(|| {
                 heading_item(
-                    fl!("trashed-on"),
-                    Length::Fixed(modified_width),
-                    HeadingOptions::TrashedOn,
+                    fl!("file-type"),
+                    Length::Fixed(type_width),
+                    HeadingOptions::Type,
                 )
-            } else {
-                heading_item(
-                    fl!("modified"),
-                    Length::Fixed(modified_width),
-                    HeadingOptions::Modified,
-                )
-            },
-            heading_item(fl!("size"), Length::Fixed(size_width), HeadingOptions::Size),
-        ])
+            })),
+        )
         .align_y(Alignment::Center)
         .height(Length::Fixed((space_m + 4).into()))
         .padding([0, space_xxs]);
@@ -3729,7 +3775,10 @@ impl Tab {
         let name_width = 300.0;
         let modified_width = 200.0;
         let size_width = 100.0;
+        let type_width = TYPE_COLUMN_WIDTH;
         let condensed = size.width < (name_width + modified_width + size_width);
+        // The type column is the first one to go when space is short
+        let show_type = size.width >= (name_width + modified_width + size_width + type_width);
         let is_search = matches!(self.location, Location::Search(..));
         let icon_size = if condensed || is_search {
             icon_sizes.list_condensed()
@@ -3865,6 +3914,20 @@ impl Tab {
                         }
                     };
 
+                    let type_text = if show_type {
+                        item.type_text()
+                    } else {
+                        String::new()
+                    };
+                    let type_cell = || {
+                        show_type.then(|| {
+                            Element::from(
+                                widget::text::body(type_text.clone())
+                                    .width(Length::Fixed(type_width)),
+                            )
+                        })
+                    };
+
                     let row = if condensed {
                         widget::row::with_children([
                             widget::icon::icon(item.icon_handle_list_condensed.clone())
@@ -3912,6 +3975,7 @@ impl Tab {
                                 .width(Length::Fixed(size_width))
                                 .into(),
                         ])
+                        .extend(type_cell())
                         .height(Length::Fixed(f32::from(row_height)))
                         .align_y(Alignment::Center)
                         .spacing(space_xxs)
@@ -3931,6 +3995,7 @@ impl Tab {
                                 .width(Length::Fixed(size_width))
                                 .into(),
                         ])
+                        .extend(type_cell())
                         .height(Length::Fixed(f32::from(row_height)))
                         .align_y(Alignment::Center)
                         .spacing(space_xxs)
@@ -4025,6 +4090,7 @@ impl Tab {
                                     .width(Length::Fixed(size_width))
                                     .into(),
                             ])
+                            .extend(type_cell())
                             .align_y(Alignment::Center)
                             .spacing(space_xxs)
                             .into()
@@ -4044,6 +4110,7 @@ impl Tab {
                                     .width(Length::Fixed(size_width))
                                     .into(),
                             ])
+                            .extend(type_cell())
                             .align_y(Alignment::Center)
                             .spacing(space_xxs)
                             .into()
@@ -5577,6 +5644,43 @@ mod tests {
             None,
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn sort_by_type() -> io::Result<()> {
+        let fs = empty_fs()?;
+        let path = fs.path();
+        for name in ["b.png", "a.txt", "c.png", "d.txt"] {
+            fs::File::create(path.join(name))?;
+        }
+        fs::create_dir(path.join("zdir"))?;
+
+        let mut tab = Tab::new(
+            Location::Path(path.into()),
+            TabConfig::default(),
+            ThumbCfg::default(),
+            None,
+            widget::Id::unique(),
+            None,
+        );
+        tab.config.folders_first = true;
+        tab.sort_name = super::HeadingOptions::Type;
+        tab.sort_direction = true;
+        tab.set_items(scan_path(&path.to_owned(), IconSizes::default()));
+        let names: Vec<_> = tab
+            .column_sort()
+            .unwrap()
+            .into_iter()
+            .map(|(_, item)| item.name.clone())
+            .collect();
+        // Folders first, then equal types grouped and ordered by name
+        let png = names.iter().position(|n| n == "b.png").unwrap();
+        let txt = names.iter().position(|n| n == "a.txt").unwrap();
+        assert_eq!(names[0], "zdir");
+        assert_eq!(names[png + 1], "c.png");
+        assert_eq!(names[txt + 1], "d.txt");
+        assert_eq!(png.abs_diff(txt), 2);
         Ok(())
     }
 

@@ -28,6 +28,8 @@ name = Name
 modified = Modified
 trashed-on = Trashed
 size = Size
+file-type = Type
+folder = Folder
 
 # Progress footer
 details = Details
@@ -348,6 +350,7 @@ change-sidebar-label = Change sidebar label
 sort-by-name = Sort by name
 sort-by-modified = Sort by modified
 sort-by-size = Sort by size
+sort-by-type = Sort by type
 sort-by-trashed = Sort by delete time
 remove-from-recents = Remove from recents
 
@@ -396,3 +399,5 @@ sort-newest-first = Newest first
 sort-oldest-first = Oldest first
 sort-smallest-to-largest = Smallest to largest
 sort-largest-to-smallest = Largest to smallest
+sort-type-a-z = Type A-Z
+sort-type-z-a = Type Z-A

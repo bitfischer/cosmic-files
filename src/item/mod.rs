@@ -504,6 +504,15 @@ pub struct Item {
 }
 
 impl Item {
+    /// Human readable file type, shown in the "Type" column
+    pub fn type_text(&self) -> String {
+        if self.metadata.is_dir() {
+            fl!("folder")
+        } else {
+            crate::mime_description::describe(&self.mime)
+        }
+    }
+
     pub(crate) fn display_name(name: &str) -> String {
         // In order to wrap at periods and underscores, add a zero width space after each one
         name.replace('.', ".\u{200B}").replace('_', "_\u{200B}")
