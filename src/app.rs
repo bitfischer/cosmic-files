@@ -3250,7 +3250,9 @@ impl Application for App {
                             }
                         }
                         DialogPage::BulkRename { entries, settings } => {
-                            let rows = bulk_rename::plan(&entries, &settings, |p| p.exists());
+                            let rows = bulk_rename::plan(&entries, &settings, |p| {
+                                p.symlink_metadata().is_ok()
+                            });
                             if rows.iter().any(|row| row.error.is_some()) {
                                 log::warn!("bulk rename completed with invalid names");
                             } else {
@@ -7048,7 +7050,7 @@ fn bulk_rename_dialog<'a>(
 
     let cosmic_theme::Spacing { space_xxs, .. } = theme::spacing();
 
-    let rows = bulk_rename::plan(entries, settings, |p| p.exists());
+    let rows = bulk_rename::plan(entries, settings, |p| p.symlink_metadata().is_ok());
     let valid = rows.iter().all(|row| row.error.is_none()) && rows.iter().any(|row| row.changed());
     let submit = valid.then_some(Message::DialogComplete);
 

@@ -110,6 +110,22 @@ pub fn plan(entries: &[Entry], settings: &Settings, exists: impl Fn(&Path) -> bo
         .collect()
 }
 
+/// A not yet existing hidden sibling path of `path`.
+fn unique_temp(path: &Path, kind: &str, i: usize) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut n = 0;
+    loop {
+        let candidate = path.with_file_name(format!(".{name}.cosmic-{kind}-{i}-{n}"));
+        if candidate.symlink_metadata().is_err() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Rename all `(from, to)` pairs. Renames that would overwrite another source
 /// (swaps, chains) go through temporary names. On failure all completed
 /// renames are rolled back.
@@ -121,12 +137,38 @@ pub fn perform(renames: &[(PathBuf, PathBuf)]) -> io::Result<()> {
     // (current path, original path) for rollback
     let mut done: Vec<(PathBuf, PathBuf)> = Vec::new();
 
+    // Undo all completed renames. Originals may be occupied by items that were
+    // already moved to their new name (swaps, chains) and `rename` silently
+    // replaces files, so first move everything to unique temporary names and
+    // only then to the original names.
     let rollback = |done: &mut Vec<(PathBuf, PathBuf)>| {
-        while let Some((current, original)) = done.pop() {
-            if let Err(err) = std::fs::rename(&current, &original) {
+        let mut parked: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(done.len());
+        for (i, (current, original)) in done.drain(..).enumerate() {
+            let temp = unique_temp(&current, "rollback", i);
+            match std::fs::rename(&current, &temp) {
+                Ok(()) => parked.push((temp, original)),
+                Err(err) => {
+                    log::error!(
+                        "failed to roll back rename of {} to {}: {}",
+                        current.display(),
+                        original.display(),
+                        err
+                    );
+                }
+            }
+        }
+        for (temp, original) in parked {
+            if original.symlink_metadata().is_ok() {
+                // Never overwrite, keep the item under its temporary name
+                log::error!(
+                    "failed to roll back: {} exists, item kept as {}",
+                    original.display(),
+                    temp.display()
+                );
+            } else if let Err(err) = std::fs::rename(&temp, &original) {
                 log::error!(
                     "failed to roll back rename of {} to {}: {}",
-                    current.display(),
+                    temp.display(),
                     original.display(),
                     err
                 );
@@ -161,18 +203,7 @@ pub fn perform(renames: &[(PathBuf, PathBuf)]) -> io::Result<()> {
     // Phase 1: move everything to unique temporary names
     let mut temps: Vec<(PathBuf, &PathBuf)> = Vec::with_capacity(renames.len());
     for (i, (from, to)) in renames.iter().enumerate() {
-        let name = from
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let mut n = 0;
-        let temp = loop {
-            let candidate = from.with_file_name(format!(".{name}.cosmic-rename-{i}-{n}"));
-            if candidate.symlink_metadata().is_err() {
-                break candidate;
-            }
-            n += 1;
-        };
+        let temp = unique_temp(from, "rename", i);
         match std::fs::rename(from, &temp) {
             Ok(()) => {
                 done.push((temp.clone(), from.clone()));
@@ -320,5 +351,23 @@ mod tests {
         assert_eq!(std::fs::read_to_string(p("b")).unwrap(), "b");
         assert!(!p("z").exists());
         assert_eq!(std::fs::read_to_string(p("c")).unwrap(), "c");
+    }
+
+    #[test]
+    fn rollback_never_overwrites_swapped_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n);
+        std::fs::write(p("a"), "a").unwrap();
+        std::fs::write(p("b"), "b").unwrap();
+        std::fs::write(p("x"), "x").unwrap();
+        // Dangling symlink: `exists()` is false, but the name is taken
+        std::os::unix::fs::symlink(p("missing"), p("z")).unwrap();
+
+        // Swap a/b, then fail on x -> z
+        let err = perform(&[(p("a"), p("b")), (p("b"), p("a")), (p("x"), p("z"))]);
+        assert!(err.is_err());
+        assert_eq!(std::fs::read_to_string(p("a")).unwrap(), "a");
+        assert_eq!(std::fs::read_to_string(p("b")).unwrap(), "b");
+        assert_eq!(std::fs::read_to_string(p("x")).unwrap(), "x");
     }
 }
